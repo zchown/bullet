@@ -26,7 +26,7 @@ use bullet_trainer::{
 };
 
 const NET_NAME: &str = "zig-nnue";
-const CHECKPOINT_DIR: &str = "/checkpoints";
+const CHECKPOINT_DIR: &str = "/kaggle/working/checkpoints";
 
 const READ_BUF_MB: usize = 2048;
 const READ_THREADS: usize = 4;
@@ -60,9 +60,9 @@ const _: () = assert!(NUM_KING_BUCKETS == 10);
 //          from eval-heavy to result-heavy (your old 0.4 -> 0.8).
 // stage 2: low-LR anneal at fixed high WDL. Cheap and usually worth 5-15 Elo.
 
-const SUPERBATCHES_STAGE0: usize = 50;
-const SUPERBATCHES_STAGE1: usize = 300;
-const SUPERBATCHES_STAGE2: usize = 100;
+const SUPERBATCHES_STAGE0: usize = 25;
+const SUPERBATCHES_STAGE1: usize = 200;
+const SUPERBATCHES_STAGE2: usize = 50;
 
 const WARMUP_SBS: usize = SUPERBATCHES_STAGE0 / 2;
 const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
