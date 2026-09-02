@@ -26,7 +26,7 @@ use bullet_trainer::{
 };
 
 const NET_NAME: &str = "zig-nnue";
-const CHECKPOINT_DIR: &str = "/kaggle/working/checkpoints";
+const CHECKPOINT_DIR: &str = "/kaggle/working/";
 
 const READ_BUF_MB: usize = 2048;
 const READ_THREADS: usize = 4;
