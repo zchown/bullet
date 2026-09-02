@@ -213,7 +213,7 @@ fn main() {
             first_scheduler_final_superbatch: WARMUP_SBS,
         }
         .boxed(),
-        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.4 }),
+        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.3 }),
         all_data.clone(),
     );
 
@@ -221,7 +221,7 @@ fn main() {
         1,
         SUPERBATCHES_STAGE1,
         lr::LinearDecayLR { initial_lr: BASE_LR, final_lr: 1e-6, final_superbatch: SUPERBATCHES_STAGE1 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.4, end: 0.8 }),
+        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.1, end: 0.5 }),
         all_data.clone(),
     );
 
