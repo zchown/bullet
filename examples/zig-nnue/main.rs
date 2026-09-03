@@ -16,7 +16,7 @@ use bullet_lib::{
     },
 };
 use bullet_trainer::{
-    model::{ModelDefinition, ModelEvaluator, ModelInputs, ModelWeights, SavedFormat},
+    model::{InitSettings, ModelDefinition, ModelEvaluator, ModelInputs, ModelWeights, SavedFormat},
     optimiser::{
         Optimiser,
         adam::{AdamW, AdamWParams},
@@ -26,7 +26,7 @@ use bullet_trainer::{
 };
 
 const NET_NAME: &str = "zig-nnue";
-const CHECKPOINT_DIR: &str = "/kaggle/working/";
+const CHECKPOINT_DIR: &str = "/kaggle/working";
 
 const READ_BUF_MB: usize = 2048;
 const READ_THREADS: usize = 4;
@@ -39,19 +39,19 @@ const QA: i16 = 255;
 const QB: i16 = 64;
 
 #[rustfmt::skip]
-pub const KING_BUCKETS: [usize; 32] = [
-    0, 1, 2, 3,
-    4, 4, 5, 5,
-    6, 6, 6, 6,
-    7, 7, 7, 7,
-    8, 8, 8, 8,
-    8, 8, 8, 8,
-    9, 9, 9, 9,
-    9, 9, 9, 9,
+const KING_BUCKETS: [usize; 32] = [
+     0,  1,  2,  3,
+     4,  5,  6,  7,
+     8,  8,  9,  9,
+    10, 10, 11, 11,
+    12, 12, 13, 13,
+    12, 12, 13, 13,
+    14, 14, 15, 15,
+    14, 14, 15, 15,
 ];
 
 const NUM_KING_BUCKETS: usize = get_num_buckets(&KING_BUCKETS);
-const _: () = assert!(NUM_KING_BUCKETS == 10);
+const _: () = assert!(NUM_KING_BUCKETS == 16);
 
 const SUPERBATCHES_STAGE0: usize = 25;
 const SUPERBATCHES_STAGE1: usize = 250;
@@ -63,6 +63,11 @@ const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
 const BASE_LR: f32 = 1e-3;
 const WARMUP_PEAK_LR: f32 = 2e-3;
 const WARMUP_FLOOR_LR: f32 = 5e-5;
+
+/// Weight clip for the feature transformer. Halved from the usual 1.98 because
+/// the effective FT weight is now the sum of two clipped tensors (l0w + l0f),
+/// so each half has to fit in half the range.
+const FT_CLIP: f32 = 0.99;
 
 struct Args {
     data: Vec<String>,
@@ -138,11 +143,42 @@ fn main() {
         .add_dense("targets", (1, 1));
 
     let defn = ModelDefinition::build(&inputs, |builder, (((stm, ntm), buckets), target)| {
-        let l0 = builder.new_affine("l0", l0_inputs, HIDDEN_SIZE);
+        // Factorised feature transformer.
+        //
+        // l0w is the usual (HIDDEN, 768 * 10) bucketed matrix. l0f is a single
+        // unbucketed (HIDDEN, 768) matrix tiled across all ten buckets, so every
+        // position trains it regardless of where its king sits — that's what
+        // stops the rare buckets learning from noise. l0f is zero-initialised,
+        // so step 0 is numerically identical to the unfactorised net.
+        //
+        // l0f is a training-time device only: it gets folded into l0w in the
+        // save format below, so the exported net has exactly the same shape and
+        // inference cost as before.
+        let ft_init = InitSettings::Normal { mean: 0.0, stdev: (2f32 / 32.0).sqrt() };
+        let l0f = builder.new_weights("l0f", (HIDDEN_SIZE, 768), InitSettings::Zeroed);
+        let l0w = builder.new_weights("l0w", (HIDDEN_SIZE, l0_inputs), ft_init)
+            + l0f.repeat(NUM_KING_BUCKETS);
+        let l0b = builder.new_weights("l0b", (HIDDEN_SIZE, 1), InitSettings::Zeroed);
+
+        let ft = |x| (l0w.matmul(x) + l0b).screlu();
+
+        // If the `+ l0b` above doesn't type-check, swap the four lines starting
+        // at `let l0f` for the block below. Same maths, only ops the `advanced`
+        // example already uses, at the cost of a second sparse matmul per
+        // perspective (noticeably slower — the FT dominates training time):
+        //
+        //     let l0 = builder.new_affine("l0", l0_inputs, HIDDEN_SIZE);
+        //     let l0f = builder.new_weights("l0f", (HIDDEN_SIZE, 768), InitSettings::Zeroed);
+        //     let l0fr = l0f.repeat(NUM_KING_BUCKETS);
+        //     let ft = |x| (l0.forward(x) + l0fr.matmul(x)).screlu();
+        //
+        // (W + F)x + b == Wx + b + Fx, and `new_affine` names its weights "l0w"
+        // and "l0b", so everything downstream is unchanged either way.
+
         let l1 = builder.new_affine("l1", 2 * HIDDEN_SIZE, NUM_OUTPUT_BUCKETS);
 
-        let stm_hidden = l0.forward(stm).screlu();
-        let ntm_hidden = l0.forward(ntm).screlu();
+        let stm_hidden = ft(stm);
+        let ntm_hidden = ft(ntm);
         let hidden_layer = stm_hidden.concat(ntm_hidden);
 
         let out = l1.forward(hidden_layer).select(buckets);
@@ -159,12 +195,25 @@ fn main() {
     let mut optimiser =
         Optimiser::<_, AdamW<_>>::new(defn, weights, device.clone(), AdamWParams::default()).unwrap();
 
-    let clip = AdamWParams { max_weight: 1.98, min_weight: -1.98, ..Default::default() };
-    optimiser.set_params_for_weight("l0w", clip);
-    optimiser.set_params_for_weight("l1w", clip);
+    let ft_clip = AdamWParams { max_weight: FT_CLIP, min_weight: -FT_CLIP, ..Default::default() };
+    optimiser.set_params_for_weight("l0w", ft_clip);
+    optimiser.set_params_for_weight("l0f", ft_clip);
+
+    let l1_clip = AdamWParams { max_weight: 1.98, min_weight: -1.98, ..Default::default() };
+    optimiser.set_params_for_weight("l1w", l1_clip);
 
     let saved_format = vec![
-        SavedFormat::id("l0w").round().quantise::<i16>(QA),
+        // Fold the factoriser into each bucket on the way out. Without this
+        // transform you'd export only the bucket-specific half and the net
+        // would be silently wrong rather than fail loudly.
+        SavedFormat::id("l0w")
+            .transform(|weights, values| {
+                let fac = weights.get("l0f").values.f32().repeat(NUM_KING_BUCKETS);
+                assert_eq!(values.len(), fac.len());
+                values.iter().zip(fac).map(|(&a, b)| a + b).collect()
+            })
+            .round()
+            .quantise::<i16>(QA),
         SavedFormat::id("l0b").round().quantise::<i16>(QA),
         SavedFormat::id("l1w").round().quantise::<i16>(QB).transpose(),
         SavedFormat::id("l1b").round().quantise::<i16>(QA * QB),
