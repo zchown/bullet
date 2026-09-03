@@ -53,13 +53,6 @@ pub const KING_BUCKETS: [usize; 32] = [
 const NUM_KING_BUCKETS: usize = get_num_buckets(&KING_BUCKETS);
 const _: () = assert!(NUM_KING_BUCKETS == 10);
 
-// stage 0: LR warmup + cooldown, low WDL. Gets the feature transformer out of
-//          its random init without an early loss spike, and lets the optimiser
-//          moments settle before the long run.
-// stage 1: the bulk of training. LR decays across the whole stage, WDL ramps
-//          from eval-heavy to result-heavy (your old 0.4 -> 0.8).
-// stage 2: low-LR anneal at fixed high WDL. Cheap and usually worth 5-15 Elo.
-
 const SUPERBATCHES_STAGE0: usize = 25;
 const SUPERBATCHES_STAGE1: usize = 250;
 const SUPERBATCHES_STAGE2: usize = 50;
@@ -72,37 +65,62 @@ const WARMUP_PEAK_LR: f32 = 2e-3;
 const WARMUP_FLOOR_LR: f32 = 5e-5;
 
 struct Args {
-    data: [String; 4],
-    tune: String,
+    data: Vec<String>,
+    tune: Vec<String>,
 }
 
 fn parse_args() -> Args {
     let mut argv = std::env::args();
     let program = argv.next().unwrap_or_else(|| NET_NAME.to_string());
-    let rest: Vec<String> = argv.collect();
 
-    let [d0, d1, d2, d3, tune] = <[String; 5]>::try_from(rest).unwrap_or_else(|rest| {
-        eprintln!("usage: {program} <data0> <data1> <data2> <tune>");
-        eprintln!("  data0..2  main training binpacks (stages 0 and 1)");
-        eprintln!("  tune      fine-tune binpack (stage 2)");
-        eprintln!("expected 4 paths, got {}", rest.len());
+    let mut data = Vec::new();
+    let mut tune = Vec::new();
+    let mut current_list = None;
+
+    for arg in argv {
+        match arg.as_str() {
+            "--data" => current_list = Some(1),
+            "--tune" => current_list = Some(2),
+            _ => {
+                match current_list {
+                    Some(1) => data.push(arg),
+                    Some(2) => tune.push(arg),
+                    _ => {
+                        eprintln!("usage: {program} --data <file1> ... --tune <file1> ...");
+                        eprintln!("Error: specify --data or --tune before providing file paths.");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+
+    if data.is_empty() || tune.is_empty() {
+        eprintln!("usage: {program} --data <file1> ... --tune <file1> ...");
+        eprintln!("Error: You must provide at least one file for both --data and --tune.");
         std::process::exit(1);
-    });
+    }
 
-    for path in [&d0, &d1, &d2, &d3, &tune] {
+    if data.len() > 8 || tune.len() > 8 {
+        eprintln!("Error: A maximum of 8 files are allowed per category.");
+        eprintln!("Provided: {} data files, {} tune files", data.len(), tune.len());
+        std::process::exit(1);
+    }
+
+    for path in data.iter().chain(tune.iter()) {
         if !std::path::Path::new(path).is_file() {
             eprintln!("not a readable file: {path}");
             std::process::exit(1);
         }
     }
 
-    Args { data: [d0, d1, d2, d3], tune }
+    Args { data, tune }
 }
 
 fn main() {
     let args = parse_args();
-    let data_paths: [&str; 4] = args.data.each_ref().map(String::as_str);
-    let tune_paths: [&str; 1] = [args.tune.as_str()];
+    let data_paths: Vec<&str> = args.data.iter().map(String::as_str).collect();
+    let tune_paths: Vec<&str> = args.tune.iter().map(String::as_str).collect();
 
     println!("train data: {data_paths:?}");
     println!("tune data:  {tune_paths:?}");
@@ -221,15 +239,15 @@ fn main() {
         1,
         SUPERBATCHES_STAGE1,
         lr::LinearDecayLR { initial_lr: BASE_LR, final_lr: 1e-6, final_superbatch: SUPERBATCHES_STAGE1 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.1, end: 0.5 }),
+        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.0, end: 0.5 }),
         all_data.clone(),
     );
 
     run(
         2,
         SUPERBATCHES_STAGE2,
-        lr::LinearDecayLR { initial_lr: 1e-5, final_lr: 1e-7, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.9 }),
+        lr::LinearDecayLR { initial_lr: 1e-6, final_lr: 1e-8, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
+        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.7 }),
         tune_data.clone(),
     );
 
