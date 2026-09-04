@@ -33,29 +33,41 @@ const READ_THREADS: usize = 4;
 const MAP_THREADS: u8 = 4;
 const SAVE_RATE: usize = 10;
 
-const HIDDEN_SIZE: usize = 1536;
+const HIDDEN_SIZE: usize = 768;
+const L1_SIZE: usize = HIDDEN_SIZE; // 2 * (HIDDEN_SIZE / 2)
+const L2: usize = 16;
+const L3: usize = 32;
 pub const NUM_OUTPUT_BUCKETS: usize = 8;
+
 const QA: i16 = 255;
-const QB: i16 = 64;
+const Q1: i16 = 128;
+const Q: i16 = 64;
+
+const FT_SHIFT: usize = 8;
+const FT_SHIFT_SCALE: f32 = QA as f32 / ((1 << FT_SHIFT) as f32);
+
+const L1_RANGE: f32 = (i8::MAX as f32 / Q1 as f32) * FT_SHIFT_SCALE * FT_SHIFT_SCALE;
+const L23_RANGE: f32 = i8::MAX as f32 / Q as f32;
+const FT_CLIP: f32 = 0.99;
 
 #[rustfmt::skip]
-const KING_BUCKETS: [usize; 32] = [
-     0,  1,  2,  3,
-     4,  5,  6,  7,
-     8,  8,  9,  9,
-    10, 10, 11, 11,
-    12, 12, 13, 13,
-    12, 12, 13, 13,
-    14, 14, 15, 15,
-    14, 14, 15, 15,
+pub const KING_BUCKETS: [usize; 32] = [
+    0, 1, 2, 3,
+    4, 4, 5, 5,
+    6, 6, 6, 6,
+    7, 7, 7, 7,
+    8, 8, 8, 8,
+    8, 8, 8, 8,
+    9, 9, 9, 9,
+    9, 9, 9, 9,
 ];
 
 const NUM_KING_BUCKETS: usize = get_num_buckets(&KING_BUCKETS);
-const _: () = assert!(NUM_KING_BUCKETS == 16);
+const _: () = assert!(NUM_KING_BUCKETS == 10);
 
-const SUPERBATCHES_STAGE0: usize = 25;
-const SUPERBATCHES_STAGE1: usize = 250;
-const SUPERBATCHES_STAGE2: usize = 50;
+const SUPERBATCHES_STAGE0: usize = 50;
+const SUPERBATCHES_STAGE1: usize = 750;
+const SUPERBATCHES_STAGE2: usize = 150;
 
 const WARMUP_SBS: usize = SUPERBATCHES_STAGE0 / 2;
 const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
@@ -63,11 +75,6 @@ const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
 const BASE_LR: f32 = 1e-3;
 const WARMUP_PEAK_LR: f32 = 2e-3;
 const WARMUP_FLOOR_LR: f32 = 5e-5;
-
-/// Weight clip for the feature transformer. Halved from the usual 1.98 because
-/// the effective FT weight is now the sum of two clipped tensors (l0w + l0f),
-/// so each half has to fit in half the range.
-const FT_CLIP: f32 = 0.99;
 
 struct Args {
     data: Vec<String>,
@@ -143,45 +150,23 @@ fn main() {
         .add_dense("targets", (1, 1));
 
     let defn = ModelDefinition::build(&inputs, |builder, (((stm, ntm), buckets), target)| {
-        // Factorised feature transformer.
-        //
-        // l0w is the usual (HIDDEN, 768 * 10) bucketed matrix. l0f is a single
-        // unbucketed (HIDDEN, 768) matrix tiled across all ten buckets, so every
-        // position trains it regardless of where its king sits — that's what
-        // stops the rare buckets learning from noise. l0f is zero-initialised,
-        // so step 0 is numerically identical to the unfactorised net.
-        //
-        // l0f is a training-time device only: it gets folded into l0w in the
-        // save format below, so the exported net has exactly the same shape and
-        // inference cost as before.
-        let ft_init = InitSettings::Normal { mean: 0.0, stdev: (2f32 / 32.0).sqrt() };
         let l0f = builder.new_weights("l0f", (HIDDEN_SIZE, 768), InitSettings::Zeroed);
-        let l0w = builder.new_weights("l0w", (HIDDEN_SIZE, l0_inputs), ft_init)
-            + l0f.repeat(NUM_KING_BUCKETS);
-        let l0b = builder.new_weights("l0b", (HIDDEN_SIZE, 1), InitSettings::Zeroed);
+        let mut l0 = builder.new_affine("l0", l0_inputs, HIDDEN_SIZE);
+        l0.weights = l0.weights + l0f.repeat(NUM_KING_BUCKETS);
 
-        let ft = |x| (l0w.matmul(x) + l0b).screlu();
+        let l1 = builder.new_affine("l1", L1_SIZE, NUM_OUTPUT_BUCKETS * L2);
+        let l2 = builder.new_affine("l2", L2, NUM_OUTPUT_BUCKETS * L3);
+        let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
 
-        // If the `+ l0b` above doesn't type-check, swap the four lines starting
-        // at `let l0f` for the block below. Same maths, only ops the `advanced`
-        // example already uses, at the cost of a second sparse matmul per
-        // perspective (noticeably slower — the FT dominates training time):
-        //
-        //     let l0 = builder.new_affine("l0", l0_inputs, HIDDEN_SIZE);
-        //     let l0f = builder.new_weights("l0f", (HIDDEN_SIZE, 768), InitSettings::Zeroed);
-        //     let l0fr = l0f.repeat(NUM_KING_BUCKETS);
-        //     let ft = |x| (l0.forward(x) + l0fr.matmul(x)).screlu();
-        //
-        // (W + F)x + b == Wx + b + Fx, and `new_affine` names its weights "l0w"
-        // and "l0b", so everything downstream is unchanged either way.
+        let ft = |x, start, end| l0.slice(start, end).forward(x).crelu();
+        let stm_hidden = ft(stm, 0, HIDDEN_SIZE / 2) * ft(stm, HIDDEN_SIZE / 2, HIDDEN_SIZE);
+        let ntm_hidden = ft(ntm, 0, HIDDEN_SIZE / 2) * ft(ntm, HIDDEN_SIZE / 2, HIDDEN_SIZE);
 
-        let l1 = builder.new_affine("l1", 2 * HIDDEN_SIZE, NUM_OUTPUT_BUCKETS);
+        let hl1 = stm_hidden.concat(ntm_hidden);
 
-        let stm_hidden = ft(stm);
-        let ntm_hidden = ft(ntm);
-        let hidden_layer = stm_hidden.concat(ntm_hidden);
-
-        let out = l1.forward(hidden_layer).select(buckets);
+        let hl2 = l1.forward(hl1).select(buckets).screlu();
+        let hl3 = l2.forward(hl2).select(buckets).crelu();
+        let out = l3.forward(hl3).select(buckets);
 
         let loss = out.sigmoid().squared_error(target);
 
@@ -199,13 +184,14 @@ fn main() {
     optimiser.set_params_for_weight("l0w", ft_clip);
     optimiser.set_params_for_weight("l0f", ft_clip);
 
-    let l1_clip = AdamWParams { max_weight: 1.98, min_weight: -1.98, ..Default::default() };
+    let l1_clip = AdamWParams { max_weight: L1_RANGE, min_weight: -L1_RANGE, ..Default::default() };
     optimiser.set_params_for_weight("l1w", l1_clip);
 
+    let l23_clip = AdamWParams { max_weight: L23_RANGE, min_weight: -L23_RANGE, ..Default::default() };
+    optimiser.set_params_for_weight("l2w", l23_clip);
+    optimiser.set_params_for_weight("l3w", l23_clip);
+
     let saved_format = vec![
-        // Fold the factoriser into each bucket on the way out. Without this
-        // transform you'd export only the bucket-specific half and the net
-        // would be silently wrong rather than fail loudly.
         SavedFormat::id("l0w")
             .transform(|weights, values| {
                 let fac = weights.get("l0f").values.f32().repeat(NUM_KING_BUCKETS);
@@ -215,8 +201,15 @@ fn main() {
             .round()
             .quantise::<i16>(QA),
         SavedFormat::id("l0b").round().quantise::<i16>(QA),
-        SavedFormat::id("l1w").round().quantise::<i16>(QB).transpose(),
-        SavedFormat::id("l1b").round().quantise::<i16>(QA * QB),
+        SavedFormat::id("l1w")
+            .transform(|_, values| values.iter().map(|f| f / (FT_SHIFT_SCALE * FT_SHIFT_SCALE)).collect())
+            .round()
+            .quantise::<i8>(Q1),
+        SavedFormat::id("l1b").round().quantise::<i32>(i32::from(Q) * 256),
+        SavedFormat::id("l2w").round().quantise::<i32>(i32::from(Q)),
+        SavedFormat::id("l2b").round().quantise::<i32>(i32::from(Q).pow(3)),
+        SavedFormat::id("l3w").round().quantise::<i32>(i32::from(Q)),
+        SavedFormat::id("l3b").round().quantise::<i32>(i32::from(Q).pow(4)),
     ];
 
     let all_data = ViriBinpackLoader::new_concat_multiple(
@@ -296,11 +289,10 @@ fn main() {
         2,
         SUPERBATCHES_STAGE2,
         lr::LinearDecayLR { initial_lr: 1e-6, final_lr: 1e-8, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.7 }),
+        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.7, end: 0.9 }),
         tune_data.clone(),
     );
 
-    // sanity check
     evaluator.load_device_weights(optimiser.weights()).unwrap();
     let evaluator_mapper = inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.0 });
 
