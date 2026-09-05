@@ -28,8 +28,8 @@ use bullet_trainer::{
 const NET_NAME: &str = "zig-nnue";
 const CHECKPOINT_DIR: &str = "/kaggle/working";
 
-const READ_BUF_MB: usize = 2048;
-const READ_THREADS: usize = 4;
+const READ_BUF_MB: usize = 2048 * 4;
+const READ_THREADS: usize = 16;
 const MAP_THREADS: u8 = 4;
 const SAVE_RATE: usize = 10;
 
@@ -62,9 +62,9 @@ const KING_BUCKETS: [usize; 32] = [
 const NUM_KING_BUCKETS: usize = get_num_buckets(&KING_BUCKETS);
 const _: () = assert!(NUM_KING_BUCKETS == 16);
 
-const SUPERBATCHES_STAGE0: usize = 25;
-const SUPERBATCHES_STAGE1: usize = 250;
-const SUPERBATCHES_STAGE2: usize = 50;
+const SUPERBATCHES_STAGE0: usize = 50;
+const SUPERBATCHES_STAGE1: usize = 750;
+const SUPERBATCHES_STAGE2: usize = 200;
 
 const WARMUP_SBS: usize = SUPERBATCHES_STAGE0 / 2;
 const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
@@ -291,7 +291,7 @@ fn main() {
         2,
         SUPERBATCHES_STAGE2,
         lr::LinearDecayLR { initial_lr: 1e-6, final_lr: 1e-8, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.7 }),
+        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.7, end: 0.85 }),
         tune_data.clone(),
     );
 
