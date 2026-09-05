@@ -34,40 +34,37 @@ const MAP_THREADS: u8 = 4;
 const SAVE_RATE: usize = 10;
 
 const HIDDEN_SIZE: usize = 768;
-const L1_SIZE: usize = HIDDEN_SIZE; // 2 * (HIDDEN_SIZE / 2)
-const L2: usize = 16;
-const L3: usize = 32;
 pub const NUM_OUTPUT_BUCKETS: usize = 8;
-
 const QA: i16 = 255;
-const Q1: i16 = 128;
-const Q: i16 = 64;
+const QB: i16 = 64;
 
-const FT_SHIFT: usize = 8;
-const FT_SHIFT_SCALE: f32 = QA as f32 / ((1 << FT_SHIFT) as f32);
+const QB_L1: i16 = 32;
 
-const L1_RANGE: f32 = (i8::MAX as f32 / Q1 as f32) * FT_SHIFT_SCALE * FT_SHIFT_SCALE;
-const L23_RANGE: f32 = i8::MAX as f32 / Q as f32;
-const FT_CLIP: f32 = 0.99;
+// 768x2 -> 16 -> 32 -> 8(buckets) head sizes.
+const L1_SIZE: usize = 16;
+const L2_SIZE: usize = 32;
+
+const BIAS_SCALE: i32 = QA as i32 * QB as i32;
+const BIAS_SCALE_L1: i32 = QA as i32 * QB_L1 as i32;
 
 #[rustfmt::skip]
-pub const KING_BUCKETS: [usize; 32] = [
-    0, 1, 2, 3,
-    4, 4, 5, 5,
-    6, 6, 6, 6,
-    7, 7, 7, 7,
-    8, 8, 8, 8,
-    8, 8, 8, 8,
-    9, 9, 9, 9,
-    9, 9, 9, 9,
+const KING_BUCKETS: [usize; 32] = [
+     0,  1,  2,  3,
+     4,  5,  6,  7,
+     8,  8,  9,  9,
+    10, 10, 11, 11,
+    12, 12, 13, 13,
+    12, 12, 13, 13,
+    14, 14, 15, 15,
+    14, 14, 15, 15,
 ];
 
 const NUM_KING_BUCKETS: usize = get_num_buckets(&KING_BUCKETS);
-const _: () = assert!(NUM_KING_BUCKETS == 10);
+const _: () = assert!(NUM_KING_BUCKETS == 16);
 
-const SUPERBATCHES_STAGE0: usize = 50;
-const SUPERBATCHES_STAGE1: usize = 750;
-const SUPERBATCHES_STAGE2: usize = 150;
+const SUPERBATCHES_STAGE0: usize = 25;
+const SUPERBATCHES_STAGE1: usize = 250;
+const SUPERBATCHES_STAGE2: usize = 50;
 
 const WARMUP_SBS: usize = SUPERBATCHES_STAGE0 / 2;
 const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
@@ -75,6 +72,8 @@ const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
 const BASE_LR: f32 = 1e-3;
 const WARMUP_PEAK_LR: f32 = 2e-3;
 const WARMUP_FLOOR_LR: f32 = 5e-5;
+
+const FT_CLIP: f32 = 0.99;
 
 struct Args {
     data: Vec<String>,
@@ -150,23 +149,26 @@ fn main() {
         .add_dense("targets", (1, 1));
 
     let defn = ModelDefinition::build(&inputs, |builder, (((stm, ntm), buckets), target)| {
+        let ft_init = InitSettings::Normal { mean: 0.0, stdev: (2f32 / 32.0).sqrt() };
         let l0f = builder.new_weights("l0f", (HIDDEN_SIZE, 768), InitSettings::Zeroed);
-        let mut l0 = builder.new_affine("l0", l0_inputs, HIDDEN_SIZE);
-        l0.weights = l0.weights + l0f.repeat(NUM_KING_BUCKETS);
+        let l0w = builder.new_weights("l0w", (HIDDEN_SIZE, l0_inputs), ft_init)
+            + l0f.repeat(NUM_KING_BUCKETS);
+        let l0b = builder.new_weights("l0b", (HIDDEN_SIZE, 1), InitSettings::Zeroed);
 
-        let l1 = builder.new_affine("l1", L1_SIZE, NUM_OUTPUT_BUCKETS * L2);
-        let l2 = builder.new_affine("l2", L2, NUM_OUTPUT_BUCKETS * L3);
-        let l3 = builder.new_affine("l3", L3, NUM_OUTPUT_BUCKETS);
+        let ft = |x| (l0w.matmul(x) + l0b).screlu();
 
-        let ft = |x, start, end| l0.slice(start, end).forward(x).crelu();
-        let stm_hidden = ft(stm, 0, HIDDEN_SIZE / 2) * ft(stm, HIDDEN_SIZE / 2, HIDDEN_SIZE);
-        let ntm_hidden = ft(ntm, 0, HIDDEN_SIZE / 2) * ft(ntm, HIDDEN_SIZE / 2, HIDDEN_SIZE);
+        let stm_hidden = ft(stm);
+        let ntm_hidden = ft(ntm);
+        let hidden_layer = stm_hidden.concat(ntm_hidden); 
 
-        let hl1 = stm_hidden.concat(ntm_hidden);
+        let l1 = builder.new_affine("l1", 2 * HIDDEN_SIZE, NUM_OUTPUT_BUCKETS * L1_SIZE);
+        let hl1 = l1.forward(hidden_layer).select(buckets).screlu();
 
-        let hl2 = l1.forward(hl1).select(buckets).screlu();
-        let hl3 = l2.forward(hl2).select(buckets).crelu();
-        let out = l3.forward(hl3).select(buckets);
+        let l2 = builder.new_affine("l2", L1_SIZE, NUM_OUTPUT_BUCKETS * L2_SIZE);
+        let hl2 = l2.forward(hl1).select(buckets).screlu();
+
+        let l3 = builder.new_affine("l3", L2_SIZE, NUM_OUTPUT_BUCKETS);
+        let out = l3.forward(hl2).select(buckets);
 
         let loss = out.sigmoid().squared_error(target);
 
@@ -184,12 +186,12 @@ fn main() {
     optimiser.set_params_for_weight("l0w", ft_clip);
     optimiser.set_params_for_weight("l0f", ft_clip);
 
-    let l1_clip = AdamWParams { max_weight: L1_RANGE, min_weight: -L1_RANGE, ..Default::default() };
+    let l1_clip = AdamWParams { max_weight: 1.98, min_weight: -1.98, ..Default::default() };
     optimiser.set_params_for_weight("l1w", l1_clip);
 
-    let l23_clip = AdamWParams { max_weight: L23_RANGE, min_weight: -L23_RANGE, ..Default::default() };
-    optimiser.set_params_for_weight("l2w", l23_clip);
-    optimiser.set_params_for_weight("l3w", l23_clip);
+    let i8_clip = AdamWParams { max_weight: 1.9, min_weight: -1.9, ..Default::default() };
+    optimiser.set_params_for_weight("l2w", i8_clip);
+    optimiser.set_params_for_weight("l3w", i8_clip);
 
     let saved_format = vec![
         SavedFormat::id("l0w")
@@ -201,15 +203,15 @@ fn main() {
             .round()
             .quantise::<i16>(QA),
         SavedFormat::id("l0b").round().quantise::<i16>(QA),
-        SavedFormat::id("l1w")
-            .transform(|_, values| values.iter().map(|f| f / (FT_SHIFT_SCALE * FT_SHIFT_SCALE)).collect())
-            .round()
-            .quantise::<i8>(Q1),
-        SavedFormat::id("l1b").round().quantise::<i32>(i32::from(Q) * 256),
-        SavedFormat::id("l2w").round().quantise::<i32>(i32::from(Q)),
-        SavedFormat::id("l2b").round().quantise::<i32>(i32::from(Q).pow(3)),
-        SavedFormat::id("l3w").round().quantise::<i32>(i32::from(Q)),
-        SavedFormat::id("l3b").round().quantise::<i32>(i32::from(Q).pow(4)),
+
+        SavedFormat::id("l1w").round().quantise::<i8>(QB_L1).transpose(),
+        SavedFormat::id("l1b").round().quantise::<i32>(BIAS_SCALE_L1),
+
+        SavedFormat::id("l2w").round().quantise::<i8>(QB).transpose(),
+        SavedFormat::id("l2b").round().quantise::<i32>(BIAS_SCALE),
+
+        SavedFormat::id("l3w").round().quantise::<i8>(QB).transpose(),
+        SavedFormat::id("l3b").round().quantise::<i32>(BIAS_SCALE),
     ];
 
     let all_data = ViriBinpackLoader::new_concat_multiple(
@@ -289,10 +291,11 @@ fn main() {
         2,
         SUPERBATCHES_STAGE2,
         lr::LinearDecayLR { initial_lr: 1e-6, final_lr: 1e-8, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.7, end: 0.9 }),
+        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.7 }),
         tune_data.clone(),
     );
 
+    // sanity check
     evaluator.load_device_weights(optimiser.weights()).unwrap();
     let evaluator_mapper = inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.0 });
 
