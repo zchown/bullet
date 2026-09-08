@@ -26,26 +26,28 @@ use bullet_trainer::{
 };
 
 const NET_NAME: &str = "zig-nnue";
-const CHECKPOINT_DIR: &str = "/kaggle/working";
+const CHECKPOINT_DIR: &str = "/workspace/checkpoints";
 
-const READ_BUF_MB: usize = 2048 * 4;
-const READ_THREADS: usize = 16;
+const RESUME_FROM: Option<(usize, usize)> = None;
+
+const READ_BUF_MB: usize = 2048 * 2;
+const READ_THREADS: usize = 4;
 const MAP_THREADS: u8 = 4;
 const SAVE_RATE: usize = 10;
 
-const HIDDEN_SIZE: usize = 768;
+const HIDDEN_SIZE: usize = 1024;
+const PAIRWISE_SIZE: usize = HIDDEN_SIZE / 2;
+const L1_SIZE: usize = 2 * PAIRWISE_SIZE;
+const L2_SIZE: usize = 16;
+const L3_SIZE: usize = 32;
+
+const _: () = assert!(HIDDEN_SIZE % 2 == 0);
+const _: () = assert!(L1_SIZE == HIDDEN_SIZE);
+
 pub const NUM_OUTPUT_BUCKETS: usize = 8;
+
 const QA: i16 = 255;
 const QB: i16 = 64;
-
-const QB_L1: i16 = 32;
-
-// 768x2 -> 16 -> 32 -> 8(buckets) head sizes.
-const L1_SIZE: usize = 16;
-const L2_SIZE: usize = 32;
-
-const BIAS_SCALE: i32 = QA as i32 * QB as i32;
-const BIAS_SCALE_L1: i32 = QA as i32 * QB_L1 as i32;
 
 #[rustfmt::skip]
 const KING_BUCKETS: [usize; 32] = [
@@ -62,9 +64,9 @@ const KING_BUCKETS: [usize; 32] = [
 const NUM_KING_BUCKETS: usize = get_num_buckets(&KING_BUCKETS);
 const _: () = assert!(NUM_KING_BUCKETS == 16);
 
-const SUPERBATCHES_STAGE0: usize = 50;
+const SUPERBATCHES_STAGE0: usize = 100;
 const SUPERBATCHES_STAGE1: usize = 750;
-const SUPERBATCHES_STAGE2: usize = 200;
+const SUPERBATCHES_STAGE2: usize = 250;
 
 const WARMUP_SBS: usize = SUPERBATCHES_STAGE0 / 2;
 const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
@@ -74,6 +76,8 @@ const WARMUP_PEAK_LR: f32 = 2e-3;
 const WARMUP_FLOOR_LR: f32 = 5e-5;
 
 const FT_CLIP: f32 = 0.99;
+
+const L1_CLIP: f32 = 1.98;
 
 struct Args {
     data: Vec<String>,
@@ -135,6 +139,10 @@ fn main() {
 
     println!("train data: {data_paths:?}");
     println!("tune data:  {tune_paths:?}");
+    println!(
+        "arch: (768x{NUM_KING_BUCKETS} -> {HIDDEN_SIZE})x2 -> {PAIRWISE_SIZE}x2 -> {L2_SIZE} -> {L3_SIZE} -> 1 \
+         [{NUM_OUTPUT_BUCKETS} output buckets]"
+    );
 
     let king_buckets = ChessBucketsMirrored::new(KING_BUCKETS);
     let output_buckets = MaterialCount::<NUM_OUTPUT_BUCKETS>;
@@ -155,20 +163,17 @@ fn main() {
             + l0f.repeat(NUM_KING_BUCKETS);
         let l0b = builder.new_weights("l0b", (HIDDEN_SIZE, 1), InitSettings::Zeroed);
 
-        let ft = |x| (l0w.matmul(x) + l0b).screlu();
+        let ft = |x| (l0w.matmul(x) + l0b).crelu().pairwise_mul();
 
-        let stm_hidden = ft(stm);
-        let ntm_hidden = ft(ntm);
-        let hidden_layer = stm_hidden.concat(ntm_hidden); 
+        let l1 = builder.new_affine("l1", L1_SIZE, NUM_OUTPUT_BUCKETS * L2_SIZE);
+        let l2 = builder.new_affine("l2", L2_SIZE, NUM_OUTPUT_BUCKETS * L3_SIZE);
+        let l3 = builder.new_affine("l3", L3_SIZE, NUM_OUTPUT_BUCKETS);
 
-        let l1 = builder.new_affine("l1", 2 * HIDDEN_SIZE, NUM_OUTPUT_BUCKETS * L1_SIZE);
-        let hl1 = l1.forward(hidden_layer).select(buckets).screlu();
+        let hidden_layer = ft(stm).concat(ft(ntm)); 
 
-        let l2 = builder.new_affine("l2", L1_SIZE, NUM_OUTPUT_BUCKETS * L2_SIZE);
-        let hl2 = l2.forward(hl1).select(buckets).screlu();
-
-        let l3 = builder.new_affine("l3", L2_SIZE, NUM_OUTPUT_BUCKETS);
-        let out = l3.forward(hl2).select(buckets);
+        let hl2 = l1.forward(hidden_layer).select(buckets).screlu();
+        let hl3 = l2.forward(hl2).select(buckets).screlu();
+        let out = l3.forward(hl3).select(buckets);
 
         let loss = out.sigmoid().squared_error(target);
 
@@ -186,12 +191,8 @@ fn main() {
     optimiser.set_params_for_weight("l0w", ft_clip);
     optimiser.set_params_for_weight("l0f", ft_clip);
 
-    let l1_clip = AdamWParams { max_weight: 1.98, min_weight: -1.98, ..Default::default() };
+    let l1_clip = AdamWParams { max_weight: L1_CLIP, min_weight: -L1_CLIP, ..Default::default() };
     optimiser.set_params_for_weight("l1w", l1_clip);
-
-    let i8_clip = AdamWParams { max_weight: 1.9, min_weight: -1.9, ..Default::default() };
-    optimiser.set_params_for_weight("l2w", i8_clip);
-    optimiser.set_params_for_weight("l3w", i8_clip);
 
     let saved_format = vec![
         SavedFormat::id("l0w")
@@ -203,15 +204,12 @@ fn main() {
             .round()
             .quantise::<i16>(QA),
         SavedFormat::id("l0b").round().quantise::<i16>(QA),
-
-        SavedFormat::id("l1w").round().quantise::<i8>(QB_L1).transpose(),
-        SavedFormat::id("l1b").round().quantise::<i32>(BIAS_SCALE_L1),
-
-        SavedFormat::id("l2w").round().quantise::<i8>(QB).transpose(),
-        SavedFormat::id("l2b").round().quantise::<i32>(BIAS_SCALE),
-
-        SavedFormat::id("l3w").round().quantise::<i8>(QB).transpose(),
-        SavedFormat::id("l3b").round().quantise::<i32>(BIAS_SCALE),
+        SavedFormat::id("l1w").round().quantise::<i8>(QB).transpose(),
+        SavedFormat::id("l1b"),
+        SavedFormat::id("l2w").transpose(),
+        SavedFormat::id("l2b"),
+        SavedFormat::id("l3w").transpose(),
+        SavedFormat::id("l3b"),
     ];
 
     let all_data = ViriBinpackLoader::new_concat_multiple(
@@ -230,14 +228,30 @@ fn main() {
 
     let params = (&inputs, king_buckets, output_buckets);
 
-    let mut run = |stage, end_superbatch, lr_schedule, mapper, reader| {
+    if let Some((stage, superbatch)) = RESUME_FROM {
+        let path = format!("{CHECKPOINT_DIR}/{NET_NAME}-stage{stage}-{superbatch}");
+        assert!(std::path::Path::new(&path).is_dir(), "no such checkpoint: {path}");
+
+        optimiser.load_from_checkpoint(&path).unwrap();
+        println!("Resumed from [{path}]");
+    }
+
+    let mut run = |stage: usize, end_superbatch, lr_schedule, mapper, reader| {
+        let start_superbatch = match RESUME_FROM {
+            Some((resume_stage, _)) if stage < resume_stage => return,
+            Some((resume_stage, superbatch)) if stage == resume_stage => superbatch + 1,
+            _ => 1,
+        };
+
+        println!("stage {stage}: superbatches {start_superbatch}..={end_superbatch}");
+
         train(
             &mut optimiser,
             TrainingSchedule {
                 steps: TrainingSteps {
                     batch_size: 16_384,
                     batches_per_superbatch: 8192,
-                    start_superbatch: 1,
+                    start_superbatch,
                     end_superbatch,
                 },
                 lr_schedule,
@@ -257,7 +271,6 @@ fn main() {
         .unwrap();
     };
 
-    // stage 0: warmup + cooldown
     run(
         0,
         SUPERBATCHES_STAGE0,
@@ -275,7 +288,7 @@ fn main() {
             first_scheduler_final_superbatch: WARMUP_SBS,
         }
         .boxed(),
-        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.3 }),
+        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.2 }),
         all_data.clone(),
     );
 
@@ -291,7 +304,7 @@ fn main() {
         2,
         SUPERBATCHES_STAGE2,
         lr::LinearDecayLR { initial_lr: 1e-6, final_lr: 1e-8, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.7, end: 0.85 }),
+        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.8 }),
         tune_data.clone(),
     );
 
