@@ -35,7 +35,7 @@ const READ_THREADS: usize = 4;
 const MAP_THREADS: u8 = 4;
 const SAVE_RATE: usize = 10;
 
-const HIDDEN_SIZE: usize = 1024;
+const HIDDEN_SIZE: usize = 1260;
 const PAIRWISE_SIZE: usize = HIDDEN_SIZE / 2;
 const L1_SIZE: usize = 2 * PAIRWISE_SIZE;
 const L2_SIZE: usize = 16;
@@ -65,8 +65,8 @@ const NUM_KING_BUCKETS: usize = get_num_buckets(&KING_BUCKETS);
 const _: () = assert!(NUM_KING_BUCKETS == 16);
 
 const SUPERBATCHES_STAGE0: usize = 100;
-const SUPERBATCHES_STAGE1: usize = 750;
-const SUPERBATCHES_STAGE2: usize = 250;
+const SUPERBATCHES_STAGE1: usize = 800;
+const SUPERBATCHES_STAGE2: usize = 200;
 
 const WARMUP_SBS: usize = SUPERBATCHES_STAGE0 / 2;
 const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
@@ -304,7 +304,7 @@ fn main() {
         2,
         SUPERBATCHES_STAGE2,
         lr::LinearDecayLR { initial_lr: 1e-6, final_lr: 1e-8, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.8 }),
+        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.7 }),
         tune_data.clone(),
     );
 
