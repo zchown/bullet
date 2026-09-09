@@ -9,7 +9,7 @@ use bullet_lib::game::formats::viriformat::{
 };
 use rand::{Rng, rng};
 
-const REBALANCE_PIECE_COUNTS: bool = false;
+const REBALANCE_PIECE_COUNTS: bool = true;
 
 static BASE_FILTER: LazyLock<Filter> = LazyLock::new(|| Filter {
     min_ply: 16,
@@ -17,10 +17,10 @@ static BASE_FILTER: LazyLock<Filter> = LazyLock::new(|| Filter {
     filter_check: true,
     filter_tactical: true,
     filter_castling: true,
-    max_eval: 15000,
+    max_eval: 20000,
     max_eval_incorrectness: 2500,
     random_fen_skipping: true,
-    random_fen_skip_probability: 0.15, 
+    random_fen_skip_probability: 0.5, 
     ..Filter::default()
 });
 
