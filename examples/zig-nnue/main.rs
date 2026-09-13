@@ -25,32 +25,32 @@ use bullet_trainer::{
     run::{DefaultDevice, TrainingSchedule, TrainingSteps, train},
 };
 
-const NET_NAME: &str = "zig-nnue";
-const CHECKPOINT_DIR: &str = "/workspace/checkpoints";
+const NET_NAME: &str = "Alkaid";
+const READ_BUF_MB: usize = 8192;
+const READ_THREADS: usize = 8;
+const MAP_THREADS: u8 = 8;
+const SAVE_RATE: usize = 50;
+const DATA_PATHS: &[&str] = &["data/moredata.vf", "data/5k1.vf", "data/5k2.vf", "data/20kdata.vf", "data/somedata.vf"];
 
-const RESUME_FROM: Option<(usize, usize)> = None;
+const SUPERBATCHES_STAGE0: usize = 100;
+const SUPERBATCHES_STAGE1: usize = 800;
+const SUPERBATCHES_STAGE2: usize = 200;
+const L1: usize = 1280;
+const L2: usize = 16;
+const L3: usize = 32;
+const Q0: i16 = 255;
+const Q1: i16 = 128;
+const Q: i16 = 64;
+const INPUT_BUCKETS: usize = get_num_buckets(&BUCKET_LAYOUT);
+const OUTPUT_BUCKETS: usize = 8;
 
-const READ_BUF_MB: usize = 2048 * 2;
-const READ_THREADS: usize = 4;
-const MAP_THREADS: u8 = 4;
-const SAVE_RATE: usize = 10;
-
-const HIDDEN_SIZE: usize = 1260;
-const PAIRWISE_SIZE: usize = HIDDEN_SIZE / 2;
-const L1_SIZE: usize = 2 * PAIRWISE_SIZE;
-const L2_SIZE: usize = 16;
-const L3_SIZE: usize = 32;
-
-const _: () = assert!(HIDDEN_SIZE % 2 == 0);
-const _: () = assert!(L1_SIZE == HIDDEN_SIZE);
-
-pub const NUM_OUTPUT_BUCKETS: usize = 8;
-
-const QA: i16 = 255;
-const QB: i16 = 64;
+const FT_SHIFT: usize = 8;
+const FT_SHIFT_SCALE: f32 = Q0 as f32 / ((1 << FT_SHIFT) as f32);
+const I8_RANGE: f32 = i8::MAX as f32 / (Q1 as f32);
+const L1_RANGE: f32 = I8_RANGE * FT_SHIFT_SCALE * FT_SHIFT_SCALE;
 
 #[rustfmt::skip]
-const KING_BUCKETS: [usize; 32] = [
+const BUCKET_LAYOUT: [usize; 32] = [
      0,  1,  2,  3,
      4,  5,  6,  7,
      8,  8,  9,  9,
@@ -61,209 +61,114 @@ const KING_BUCKETS: [usize; 32] = [
     14, 14, 15, 15,
 ];
 
-const NUM_KING_BUCKETS: usize = get_num_buckets(&KING_BUCKETS);
-const _: () = assert!(NUM_KING_BUCKETS == 16);
-
-const SUPERBATCHES_STAGE0: usize = 100;
-const SUPERBATCHES_STAGE1: usize = 800;
-const SUPERBATCHES_STAGE2: usize = 200;
-
-const WARMUP_SBS: usize = SUPERBATCHES_STAGE0 / 2;
-const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
-
-const BASE_LR: f32 = 1e-3;
-const WARMUP_PEAK_LR: f32 = 2e-3;
-const WARMUP_FLOOR_LR: f32 = 5e-5;
-
-const FT_CLIP: f32 = 0.99;
-
-const L1_CLIP: f32 = 1.98;
-
-struct Args {
-    data: Vec<String>,
-    tune: Vec<String>,
-}
-
-fn parse_args() -> Args {
-    let mut argv = std::env::args();
-    let program = argv.next().unwrap_or_else(|| NET_NAME.to_string());
-
-    let mut data = Vec::new();
-    let mut tune = Vec::new();
-    let mut current_list = None;
-
-    for arg in argv {
-        match arg.as_str() {
-            "--data" => current_list = Some(1),
-            "--tune" => current_list = Some(2),
-            _ => {
-                match current_list {
-                    Some(1) => data.push(arg),
-                    Some(2) => tune.push(arg),
-                    _ => {
-                        eprintln!("usage: {program} --data <file1> ... --tune <file1> ...");
-                        eprintln!("Error: specify --data or --tune before providing file paths.");
-                        std::process::exit(1);
-                    }
-                }
-            }
-        }
-    }
-
-    if data.is_empty() || tune.is_empty() {
-        eprintln!("usage: {program} --data <file1> ... --tune <file1> ...");
-        eprintln!("Error: You must provide at least one file for both --data and --tune.");
-        std::process::exit(1);
-    }
-
-    if data.len() > 8 || tune.len() > 8 {
-        eprintln!("Error: A maximum of 8 files are allowed per category.");
-        eprintln!("Provided: {} data files, {} tune files", data.len(), tune.len());
-        std::process::exit(1);
-    }
-
-    for path in data.iter().chain(tune.iter()) {
-        if !std::path::Path::new(path).is_file() {
-            eprintln!("not a readable file: {path}");
-            std::process::exit(1);
-        }
-    }
-
-    Args { data, tune }
-}
-
 fn main() {
-    let args = parse_args();
-    let data_paths: Vec<&str> = args.data.iter().map(String::as_str).collect();
-    let tune_paths: Vec<&str> = args.tune.iter().map(String::as_str).collect();
-
-    println!("train data: {data_paths:?}");
-    println!("tune data:  {tune_paths:?}");
-    println!(
-        "arch: (768x{NUM_KING_BUCKETS} -> {HIDDEN_SIZE})x2 -> {PAIRWISE_SIZE}x2 -> {L2_SIZE} -> {L3_SIZE} -> 1 \
-         [{NUM_OUTPUT_BUCKETS} output buckets]"
-    );
-
-    let king_buckets = ChessBucketsMirrored::new(KING_BUCKETS);
-    let output_buckets = MaterialCount::<NUM_OUTPUT_BUCKETS>;
-
-    let l0_inputs = king_buckets.num_inputs();
-    let l0_max_active = king_buckets.max_active();
+    let psqt = ChessBucketsMirrored::new(BUCKET_LAYOUT);
+    let output_buckets = MaterialCount::<OUTPUT_BUCKETS>;
 
     let inputs = ModelInputs::default()
-        .add_sparse("stm", (l0_inputs, 1), l0_max_active)
-        .add_sparse("ntm", (l0_inputs, 1), l0_max_active)
-        .add_sparse("buckets", (NUM_OUTPUT_BUCKETS, 1), 1)
+        .add_sparse("stm/psqt", (psqt.num_inputs(), 1), psqt.max_active())
+        .add_sparse("ntm/psqt", (psqt.num_inputs(), 1), psqt.max_active())
+        .add_sparse("buckets", (OUTPUT_BUCKETS, 1), 1)
         .add_dense("targets", (1, 1));
 
-    let defn = ModelDefinition::build(&inputs, |builder, (((stm, ntm), buckets), target)| {
-        let ft_init = InitSettings::Normal { mean: 0.0, stdev: (2f32 / 32.0).sqrt() };
-        let l0f = builder.new_weights("l0f", (HIDDEN_SIZE, 768), InitSettings::Zeroed);
-        let l0w = builder.new_weights("l0w", (HIDDEN_SIZE, l0_inputs), ft_init)
-            + l0f.repeat(NUM_KING_BUCKETS);
-        let l0b = builder.new_weights("l0b", (HIDDEN_SIZE, 1), InitSettings::Zeroed);
+    let defn = ModelDefinition::build(
+        &inputs,
+        |builder, (((stm_psqt, ntm_psqt), output_buckets), target)| {
+            let l0f = builder.new_weights("l0/fac", (L1, 768), InitSettings::Zeroed);
+            let psqt_init = InitSettings::Normal { mean: 0.0, stdev: (2f32 / 32.0).sqrt() };
+            let mut l0_psqt = builder.new_weights("l0/psqt/w", (L1, psqt.num_inputs()), psqt_init);
+            l0_psqt = l0_psqt + l0f.repeat(psqt.num_inputs() / 768);
+            let l0_b = builder.new_weights("l0/psqt/b", (L1, 1), InitSettings::Zeroed);
 
-        let ft = |x| (l0w.matmul(x) + l0b).crelu().pairwise_mul();
+            let l1 = builder.new_affine("l1/", L1, OUTPUT_BUCKETS * L2);
+            let l2 = builder.new_affine("l2/", L2 * 2, OUTPUT_BUCKETS * L3);
+            let l3 = builder.new_affine("l3/", L3, OUTPUT_BUCKETS);
 
-        let l1 = builder.new_affine("l1", L1_SIZE, NUM_OUTPUT_BUCKETS * L2_SIZE);
-        let l2 = builder.new_affine("l2", L2_SIZE, NUM_OUTPUT_BUCKETS * L3_SIZE);
-        let l3 = builder.new_affine("l3", L3_SIZE, NUM_OUTPUT_BUCKETS);
+            let ft = |psqt, start, end| {
+                (l0_psqt.slice_rows(start, end).matmul(psqt) + l0_b.slice_rows(start, end)).crelu()
+            };
+            let stm_hidden = ft(stm_psqt, 0, L1 / 2) * ft(stm_psqt, L1 / 2, L1);
+            let ntm_hidden = ft(ntm_psqt, 0, L1 / 2) * ft(ntm_psqt, L1 / 2, L1);
+            let l0_out = stm_hidden.concat(ntm_hidden);
 
-        let hidden_layer = ft(stm).concat(ft(ntm)); 
+            let l0_out_norm = l0_out.reduce_sum_rows() / (L1 as f32);
 
-        let hl2 = l1.forward(hidden_layer).select(buckets).screlu();
-        let hl3 = l2.forward(hl2).select(buckets).screlu();
-        let out = l3.forward(hl3).select(buckets);
+            let l1_out = l1.forward(l0_out).select(output_buckets);
+            let hl2 = l1_out.concat(l1_out.abs_pow(2.0)).crelu();
 
-        let loss = out.sigmoid().squared_error(target);
+            let l2_out = l2.forward(hl2).select(output_buckets);
+            let hl3 = l2_out.crelu();
 
-        (Some(loss.reduce_sum_batch()), vec![("output".to_string(), out)])
-    });
+            let l3_out = l3.forward(hl3).select(output_buckets);
+
+            let loss = l3_out.sigmoid().squared_error(target);
+
+            let loss = loss + 0.005 * l0_out_norm;
+
+            (Some(loss.reduce_sum_batch()), vec![("output".to_string(), l3_out)])
+        },
+    );
 
     let weights = ModelWeights::new(&defn, 12412421);
     let device = DefaultDevice::new(0).unwrap();
+    let params = AdamWParams::default();
 
     let mut evaluator = ModelEvaluator::new(&defn, device.clone()).unwrap();
-    let mut optimiser =
-        Optimiser::<_, AdamW<_>>::new(defn, weights, device.clone(), AdamWParams::default()).unwrap();
+    let mut optimiser = Optimiser::<_, AdamW<_>>::new(defn, weights, device.clone(), params).unwrap();
 
-    let ft_clip = AdamWParams { max_weight: FT_CLIP, min_weight: -FT_CLIP, ..Default::default() };
-    optimiser.set_params_for_weight("l0w", ft_clip);
-    optimiser.set_params_for_weight("l0f", ft_clip);
+    let l0_clip = AdamWParams { max_weight: 0.99, min_weight: -0.99, ..Default::default() };
+    optimiser.set_params_for_weight("l0/fac", l0_clip);
+    optimiser.set_params_for_weight("l0/psqt/w", l0_clip);
 
-    let l1_clip = AdamWParams { max_weight: L1_CLIP, min_weight: -L1_CLIP, ..Default::default() };
-    optimiser.set_params_for_weight("l1w", l1_clip);
+    let l1_clip = AdamWParams { max_weight: L1_RANGE, min_weight: -L1_RANGE, ..Default::default() };
+    optimiser.set_params_for_weight("l1/w", l1_clip);
 
     let saved_format = vec![
-        SavedFormat::id("l0w")
+        SavedFormat::id("l0/psqt/w")
             .transform(|weights, values| {
-                let fac = weights.get("l0f").values.f32().repeat(NUM_KING_BUCKETS);
+                let fac = weights.get("l0/fac").values.f32().repeat(INPUT_BUCKETS);
                 assert_eq!(values.len(), fac.len());
                 values.iter().zip(fac).map(|(&a, b)| a + b).collect()
             })
             .round()
-            .quantise::<i16>(QA),
-        SavedFormat::id("l0b").round().quantise::<i16>(QA),
-        SavedFormat::id("l1w").round().quantise::<i8>(QB).transpose(),
-        SavedFormat::id("l1b"),
-        SavedFormat::id("l2w").transpose(),
-        SavedFormat::id("l2b"),
-        SavedFormat::id("l3w").transpose(),
-        SavedFormat::id("l3b"),
+            .quantise::<i16>(Q0),
+        SavedFormat::id("l0/psqt/b").round().quantise::<i16>(Q0),
+        SavedFormat::id("l1/w")
+            .transform(|_, values| values.iter().map(|f| f / (FT_SHIFT_SCALE * FT_SHIFT_SCALE)).collect())
+            .round()
+            .quantise::<i8>(Q1),
+        SavedFormat::id("l1/b").round().quantise::<i32>(i32::from(Q) * 256),
+        SavedFormat::id("l2/w").round().quantise::<i32>(i32::from(Q)),
+        SavedFormat::id("l2/b").round().quantise::<i32>(i32::from(Q).pow(3)),
+        SavedFormat::id("l3/w").round().quantise::<i32>(i32::from(Q)),
+        SavedFormat::id("l3/b").round().quantise::<i32>(i32::from(Q).pow(4)),
     ];
 
-    let all_data = ViriBinpackLoader::new_concat_multiple(
-        &data_paths,
-        READ_BUF_MB,
-        READ_THREADS,
-        ViriFilter::Custom(filter::should_keep),
-    );
+    let reader =
+        ViriBinpackLoader::new_concat_multiple(DATA_PATHS, READ_BUF_MB, READ_THREADS, ViriFilter::Custom(filter::should_keep));
 
-    let tune_data = ViriBinpackLoader::new_concat_multiple(
-        &tune_paths,
-        READ_BUF_MB,
-        READ_THREADS,
-        ViriFilter::Custom(filter::should_keep),
-    );
+    let params = (&inputs, psqt, output_buckets);
 
-    let params = (&inputs, king_buckets, output_buckets);
-
-    if let Some((stage, superbatch)) = RESUME_FROM {
-        let path = format!("{CHECKPOINT_DIR}/{NET_NAME}-stage{stage}-{superbatch}");
-        assert!(std::path::Path::new(&path).is_dir(), "no such checkpoint: {path}");
-
-        optimiser.load_from_checkpoint(&path).unwrap();
-        println!("Resumed from [{path}]");
-    }
-
-    let mut run = |stage: usize, end_superbatch, lr_schedule, mapper, reader| {
-        let start_superbatch = match RESUME_FROM {
-            Some((resume_stage, _)) if stage < resume_stage => return,
-            Some((resume_stage, superbatch)) if stage == resume_stage => superbatch + 1,
-            _ => 1,
-        };
-
-        println!("stage {stage}: superbatches {start_superbatch}..={end_superbatch}");
-
+    let mut run = |stage, end_superbatch, lr_schedule, mapper| {
         train(
             &mut optimiser,
             TrainingSchedule {
                 steps: TrainingSteps {
-                    batch_size: 16_384,
-                    batches_per_superbatch: 8192,
-                    start_superbatch,
+                    batch_size: 16_384 * 8,
+                    batches_per_superbatch: 6104 / 8,
+                    start_superbatch: 1,
                     end_superbatch,
                 },
                 lr_schedule,
                 log_rate: 128,
             },
-            ReadMapLoader::new(reader, mapper, MAP_THREADS),
+            ReadMapLoader::new(reader.clone(), mapper, MAP_THREADS),
             |_, _, _| {},
             |optimiser, step| {
                 let superbatch = step.superbatch();
                 if superbatch.is_multiple_of(SAVE_RATE) || superbatch == step.final_superbatch() {
                     let name = format!("{NET_NAME}-stage{stage}-{superbatch}");
-                    save_to_checkpoint(optimiser, &saved_format, &format!("{CHECKPOINT_DIR}/{name}"));
+                    save_to_checkpoint(optimiser, &saved_format, &format!("checkpoints/{name}"));
                     println!("Saved [{name}]");
                 }
             },
@@ -271,58 +176,50 @@ fn main() {
         .unwrap();
     };
 
+    const WARMUP_SBS: usize = SUPERBATCHES_STAGE0 / 2;
+    const COOLDOWN_SBS: usize = SUPERBATCHES_STAGE0 - WARMUP_SBS;
     run(
         0,
         SUPERBATCHES_STAGE0,
         lr::Sequence {
-            first: lr::LinearDecayLR {
-                initial_lr: WARMUP_FLOOR_LR,
-                final_lr: WARMUP_PEAK_LR,
-                final_superbatch: WARMUP_SBS,
-            },
-            second: lr::LinearDecayLR {
-                initial_lr: WARMUP_PEAK_LR,
-                final_lr: WARMUP_FLOOR_LR,
-                final_superbatch: COOLDOWN_SBS,
-            },
+            first: lr::LinearDecayLR { initial_lr: 1e-4, final_lr: 5e-3, final_superbatch: WARMUP_SBS },
+            second: lr::LinearDecayLR { initial_lr: 5e-3, final_lr: 1e-4, final_superbatch: COOLDOWN_SBS },
             first_scheduler_final_superbatch: WARMUP_SBS,
         }
         .boxed(),
         inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.2 }),
-        all_data.clone(),
     );
 
     run(
         1,
         SUPERBATCHES_STAGE1,
-        lr::LinearDecayLR { initial_lr: BASE_LR, final_lr: 1e-6, final_superbatch: SUPERBATCHES_STAGE1 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.0, end: 0.5 }),
-        all_data.clone(),
+        lr::LinearDecayLR { initial_lr: 1e-3, final_lr: 1e-6, final_superbatch: SUPERBATCHES_STAGE1 }.boxed(),
+        inputs::make_inputs_mapper(params, wdl::LinearWDL { start: 0.2, end: 0.5 }),
     );
 
     run(
         2,
         SUPERBATCHES_STAGE2,
-        lr::LinearDecayLR { initial_lr: 1e-6, final_lr: 1e-8, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
+        lr::LinearDecayLR { initial_lr: 1e-6, final_lr: 1e-7, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
         inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.7 }),
-        tune_data.clone(),
     );
 
-    // sanity check
     evaluator.load_device_weights(optimiser.weights()).unwrap();
     let evaluator_mapper = inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.0 });
 
     for fen in [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
-        "8/2p5/3p4/KP5r/1R3p1k/8/4P1P1/8 w - - 0 1",
-        "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNB1KBNR w KQkq - 0 1",
+        "r3k2r/Pppp1ppp/1b3nbN/nP6/BBP1P3/q4N2/P2P2PP/q2Q1R1K w kq - 0 2",
+        "rn1qkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "r1bqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+        "1nbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQka - 0 1",
     ] {
         let pos = format!("{fen} | 0 | 0.0").parse().unwrap();
-        let model_inputs = evaluator_mapper.map(&[pos], Default::default(), 1).to_device(&device).unwrap();
-        let output = evaluator.evaluate(&model_inputs).unwrap().get("output").unwrap();
+        let inputs = evaluator_mapper.map(&[pos], Default::default(), 1).to_device(&device).unwrap();
+        let output = evaluator.evaluate(&inputs).unwrap().get("output").unwrap();
         let [value] = output.to_host().unwrap().f32()[..] else { panic!() };
-        println!("FEN:  {fen}");
-        println!("EVAL: {}", inputs::EVAL_SCALE * value);
+        println!("FEN: {fen}");
+        println!("EVAL: {}", 400.0 * value);
     }
 }
