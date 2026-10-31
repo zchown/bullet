@@ -22,7 +22,7 @@ use bullet_trainer::{
         adam::{AdamW, AdamWParams},
     },
     reader::ReadMapLoader,
-    run::{DefaultDevice, TrainingSchedule, TrainingSteps, train},
+    run::{DefaultDevice, HostPool, TrainingSchedule, TrainingSteps, train},
 };
 
 const NET_NAME: &str = "Alkaid";
@@ -161,6 +161,7 @@ fn main() {
                 },
                 lr_schedule,
                 log_rate: 128,
+                track_grad_norms: false,
             },
             ReadMapLoader::new(reader.clone(), mapper, MAP_THREADS),
             |_, _, _| {},
@@ -207,6 +208,8 @@ fn main() {
     evaluator.load_device_weights(optimiser.weights()).unwrap();
     let evaluator_mapper = inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.0 });
 
+    let pool = HostPool::new(device.clone());
+
     for fen in [
         "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
         "r3k2r/p1ppqpb1/bn2pnp1/3PN3/1p2P3/2N2Q1p/PPPBBPPP/R3K2R w KQkq - 0 1",
@@ -216,7 +219,7 @@ fn main() {
         "1nbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQka - 0 1",
     ] {
         let pos = format!("{fen} | 0 | 0.0").parse().unwrap();
-        let inputs = evaluator_mapper.map(&[pos], Default::default(), 1).to_device(&device).unwrap();
+        let inputs = evaluator_mapper.map(&pool, &[pos], Default::default(), 1).unwrap().to_device(&device).unwrap();
         let output = evaluator.evaluate(&inputs).unwrap().get("output").unwrap();
         let [value] = output.to_host().unwrap().f32()[..] else { panic!() };
         println!("FEN: {fen}");
