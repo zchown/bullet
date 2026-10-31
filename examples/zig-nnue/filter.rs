@@ -17,8 +17,8 @@ static BASE_FILTER: LazyLock<Filter> = LazyLock::new(|| Filter {
     filter_check: true,
     filter_tactical: true,
     filter_castling: true,
-    max_eval: 20000,
-    max_eval_incorrectness: 2500,
+    max_eval: 15000,
+    max_eval_incorrectness: 2000,
     random_fen_skipping: true,
     random_fen_skip_probability: 0.5, 
     ..Filter::default()
