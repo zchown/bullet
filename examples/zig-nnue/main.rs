@@ -30,7 +30,7 @@ const READ_BUF_MB: usize = 8192;
 const READ_THREADS: usize = 8;
 const MAP_THREADS: u8 = 8;
 const SAVE_RATE: usize = 50;
-const DATA_PATHS: &[&str] = &["data/moredata.vf", "data/5k1.vf", "data/5k2.vf", "data/20kdata.vf", "data/somedata.vf"];
+const DATA_PATHS: &[&str] = &["/workspace/data/multi_data_dfrc.vf", "/workspace/data/multi_data_dfrc_norm_tb.vf"];
 
 const SUPERBATCHES_STAGE0: usize = 50;
 const SUPERBATCHES_STAGE1: usize = 600;
