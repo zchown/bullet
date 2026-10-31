@@ -33,9 +33,9 @@ const SAVE_RATE: usize = 50;
 const DATA_PATHS: &[&str] = &["/workspace/data/multi_data_dfrc.vf", "/workspace/data/multi_data_norm_tb.vf"];
 
 const SUPERBATCHES_STAGE0: usize = 50;
-const SUPERBATCHES_STAGE1: usize = 600;
-const SUPERBATCHES_STAGE2: usize = 100;
-const L1: usize = 1280;
+const SUPERBATCHES_STAGE1: usize = 750;
+const SUPERBATCHES_STAGE2: usize = 200;
+const L1: usize = 1536;
 const L2: usize = 16;
 const L3: usize = 32;
 const Q0: i16 = 255;
@@ -202,7 +202,7 @@ fn main() {
         2,
         SUPERBATCHES_STAGE2,
         lr::LinearDecayLR { initial_lr: 1e-5, final_lr: 1e-7, final_superbatch: SUPERBATCHES_STAGE2 }.boxed(),
-        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.5 }),
+        inputs::make_inputs_mapper(params, wdl::ConstantWDL { value: 0.7 }),
     );
 
     evaluator.load_device_weights(optimiser.weights()).unwrap();
